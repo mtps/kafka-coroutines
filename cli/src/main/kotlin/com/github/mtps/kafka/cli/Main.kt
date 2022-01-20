@@ -56,19 +56,21 @@ fun main() {
 	runBlocking {
 		log.info("creating kafka channel")
 		launch {
-			val list = mutableListOf<String>()
+			val db = mutableListOf<Pair<UUID, String>>()
 
 			kafkaFlow<String, String>(props) { subscribe(topics) }
 				.transform {
 					// Mimic local storage.
-					list += "${it.record.key()}-${it.record.value()}"
+					val newID = UUID.randomUUID()
+					db += newID to "${it.record.key()}-${it.record.value()}"
+					// Commit this receipt back to kafka.
 					it.ack()
 
-					emit(it.record)
+					emit(newID to it.record)
 				}
 				.collect {
 					// Context of main thread
-					log.info("recv: ${it.key()} -> ${it.value()}")
+					log.info("recv: ${it.first} :: ${it.second.key()} -> ${it.second.value()}")
 				}
 		}
 
