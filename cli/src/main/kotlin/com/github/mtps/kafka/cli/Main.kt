@@ -9,18 +9,27 @@ import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.CoroutineContext
+import kotlin.random.Random
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.cancellable
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.onStart
+import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.flow.transform
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import mu.KotlinLogging
 import org.apache.kafka.clients.consumer.ConsumerConfig
+import org.apache.kafka.clients.consumer.ConsumerRecord
 import org.apache.kafka.clients.producer.KafkaProducer
 import org.apache.kafka.clients.producer.ProducerConfig
 import org.apache.kafka.clients.producer.ProducerRecord
@@ -31,7 +40,8 @@ import org.slf4j.LoggerFactory
 val props = mapOf(
 	ConsumerConfig.CLIENT_ID_CONFIG to UUID.randomUUID().toString(),
 	ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG to "localhost:9092",
-	ConsumerConfig.MAX_POLL_RECORDS_CONFIG to 100,
+	ConsumerConfig.MAX_POLL_RECORDS_CONFIG to 15,
+	ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG to false,
 	ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG to 10000,
 	ConsumerConfig.GROUP_ID_CONFIG to "test-group",
 	ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG to StringDeserializer::class.java,
@@ -55,38 +65,40 @@ fun main() {
 
 	runBlocking {
 		log.info("creating kafka channel")
+
+		val db = mutableListOf<Pair<UUID, String>>()
+		val kafkaFlow = kafkaFlow<String, String>(props) { subscribe(topics) }
+			.receiveAsFlow()
+			.transform {
+				// Mimic local storage.
+				val newID = UUID.randomUUID()
+				db += newID to "${it.record.key()}-${it.record.value()}"
+
+				// Random delay.
+				// delay(Duration.ofMillis(Random.nextLong(500)).toMillis())
+
+				// Commit this receipt back to kafka.
+				emit(newID to it.ack())
+			}
+
+		val count = 100
 		launch {
-			val db = mutableListOf<Pair<UUID, String>>()
-
-			kafkaFlow<String, String>(props) { subscribe(topics) }
-				.transform {
-					// Mimic local storage.
-					val newID = UUID.randomUUID()
-					db += newID to "${it.record.key()}-${it.record.value()}"
-					// Commit this receipt back to kafka.
-					it.ack()
-
-					emit(newID to it.record)
-				}
-				.collect {
-					// Context of main thread
-					log.info("recv: ${it.first} :: ${it.second.key()} -> ${it.second.value()}")
-				}
-		}
-
-		log.info("launching producer")
-		launch(Dispatchers.IO) {
-			val producer = KafkaProducer(props, StringSerializer(), StringSerializer())
-			val count = AtomicInteger(0)
-			while (true) {
-				repeat(10) {
-					val sent = producer.send(ProducerRecord("test", "key-${count.get()}", "value-$it")).asDeferred().await()
-					log.info("sent $sent")
-				}
-				count.incrementAndGet()
-				delay(5000)
+			kafkaFlow.collect {
+				// Context of main thread
+				log.info("recv: ${it.first} :: ${it.second.record.key()} -> ${it.second.record.value()}")
 			}
 		}
+
+		launch {
+			val producer = KafkaProducer(props, StringSerializer(), StringSerializer())
+			val c = AtomicInteger(0)
+			repeat(count) {
+				val sent = producer.send(ProducerRecord("test", "key-${c.get()}", "value-$it")).asDeferred().await()
+				log.info("sent $sent")
+			}
+			c.incrementAndGet()
+		}
+		log.info("done!")
 	}
 }
 

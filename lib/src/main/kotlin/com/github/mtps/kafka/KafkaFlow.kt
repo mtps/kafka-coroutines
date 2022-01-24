@@ -1,0 +1,142 @@
+package com.github.mtps.kafka
+
+import java.time.Duration
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.concurrent.thread
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.InternalCoroutinesApi
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.ChannelIterator
+import kotlinx.coroutines.channels.ChannelResult
+import kotlinx.coroutines.channels.ReceiveChannel
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.selects.SelectClause1
+import mu.KotlinLogging
+import org.apache.kafka.clients.consumer.Consumer
+import org.apache.kafka.clients.consumer.KafkaConsumer
+
+@OptIn(ExperimentalCoroutinesApi::class, InternalCoroutinesApi::class)
+fun <K, V> kafkaFlow(
+	consumerProperties: Map<String, Any>,
+	topics: Set<String> = emptySet(),
+	name: String = "kafka-channel",
+	pollInterval: Duration = DEFAULT_POLL_INTERVAL,
+	init: Consumer<K, V>.() -> Unit,
+): ReceiveChannel<UnAckedConsumerRecord<K, V>> {
+	return KafkaFlow(consumerProperties, topics.toList(), name, pollInterval, init).also {
+		Runtime.getRuntime().addShutdownHook(Thread {
+			it.cancel()
+		})
+	}
+}
+
+class KafkaFlow<K, V>(
+	consumerProperties: Map<String, Any>,
+	topics: List<String> = emptyList(),
+	name: String = "kafka-channel",
+	private val pollInterval: Duration = DEFAULT_POLL_INTERVAL,
+	private val init: Consumer<K, V>.() -> Unit = { subscribe(topics) },
+) : ReceiveChannel<UnAckedConsumerRecord<K, V>> {
+	companion object {
+		private val threadCounter = AtomicInteger(0)
+	}
+
+	private val log = KotlinLogging.logger {}
+	private val thread = thread(name = "$name-${threadCounter.getAndIncrement()}", block = { run() }, isDaemon = true, start = false)
+	private val consumer = KafkaConsumer<K, V>(consumerProperties)
+	private val sendChannel = Channel<UnAckedConsumerRecord<K, V>>(Channel.UNLIMITED)
+
+	@OptIn(ExperimentalCoroutinesApi::class)
+	private inline fun <T> Channel<T>.use(block: (Channel<T>) -> Unit) {
+		try {
+			block(this)
+			close()
+		} catch (e: Throwable) {
+			close(e)
+		}
+	}
+
+	@OptIn(ExperimentalCoroutinesApi::class)
+	fun run() {
+		consumer.init()
+
+		runBlocking {
+			try {
+				while (!sendChannel.isClosedForSend) {
+					val polled = consumer.poll(Duration.ZERO).ifEmpty { consumer.poll(pollInterval) }
+					val polledCount = polled.count()
+					if (polledCount == 0) {
+						continue
+					}
+
+					log.debug("poll() got $polledCount records.")
+					Channel<CommitConsumerRecord<K, V>>(capacity = polled.count()).use { ackChannel ->
+						for (it in polled) {
+							sendChannel.send(UnAckedConsumerRecordImpl(it, ackChannel, System.currentTimeMillis()))
+						}
+
+						if (polledCount > 0) {
+							val count = AtomicInteger(polledCount)
+							while (count.getAndDecrement() > 0) {
+								val it = ackChannel.receive()
+								log.debug { "ack(${it.duration.toMillis()}ms):${it.asCommitable()}" }
+								consumer.commitSync(it.asCommitable())
+							}
+						}
+					}
+				}
+			} finally {
+				log.info("shutting down consumer thread")
+				consumer.unsubscribe()
+				consumer.close()
+				sendChannel.cancel(CancellationException("consumer shut down"))
+			}
+		}
+	}
+
+	fun start() {
+		if (!thread.isAlive) {
+			log.info("starting consumer thread")
+			thread.start()
+		}
+	}
+
+	@ExperimentalCoroutinesApi
+	override val isClosedForReceive: Boolean = sendChannel.isClosedForReceive
+
+	@ExperimentalCoroutinesApi
+	override val isEmpty: Boolean = sendChannel.isEmpty
+	override val onReceive: SelectClause1<UnAckedConsumerRecord<K, V>> = sendChannel.onReceive
+	override val onReceiveCatching: SelectClause1<ChannelResult<UnAckedConsumerRecord<K, V>>> = sendChannel.onReceiveCatching
+
+	override fun cancel(cause: Throwable?): Boolean {
+		cancel(CancellationException("cancel", cause))
+		return true
+	}
+
+	override fun cancel(cause: CancellationException?) {
+		consumer.wakeup()
+		sendChannel.cancel(cause)
+	}
+
+	override fun iterator(): ChannelIterator<UnAckedConsumerRecord<K, V>> {
+		start()
+		return sendChannel.iterator()
+	}
+
+	override suspend fun receive(): UnAckedConsumerRecord<K, V> {
+		start()
+		return sendChannel.receive()
+	}
+
+	override suspend fun receiveCatching(): ChannelResult<UnAckedConsumerRecord<K, V>> {
+		start()
+		return sendChannel.receiveCatching()
+	}
+
+	override fun tryReceive(): ChannelResult<UnAckedConsumerRecord<K, V>> {
+		start()
+		return sendChannel.tryReceive()
+	}
+}
