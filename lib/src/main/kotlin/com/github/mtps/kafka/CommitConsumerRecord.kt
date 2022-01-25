@@ -4,7 +4,7 @@ import java.time.Duration
 import org.apache.kafka.clients.consumer.OffsetAndMetadata
 import org.apache.kafka.common.TopicPartition
 
-interface CommitConsumerRecord<K, V> {
+interface CommitConsumerRecord {
 	val duration: Duration
 	val topicPartition: TopicPartition
 	val offsetAndMetadata: OffsetAndMetadata
@@ -12,8 +12,8 @@ interface CommitConsumerRecord<K, V> {
 	fun asCommitable(): Map<TopicPartition, OffsetAndMetadata> = mapOf(topicPartition to offsetAndMetadata)
 }
 
-class CommitConsumerRecordImpl<K, V>(
+class CommitConsumerRecordImpl(
 	override val duration: Duration,
 	override val topicPartition: TopicPartition,
 	override val offsetAndMetadata: OffsetAndMetadata
-) : CommitConsumerRecord<K, V>
+) : CommitConsumerRecord

@@ -19,12 +19,13 @@ import org.apache.kafka.clients.consumer.KafkaConsumer
 @OptIn(ExperimentalCoroutinesApi::class, InternalCoroutinesApi::class)
 fun <K, V> kafkaFlow(
 	consumerProperties: Map<String, Any>,
-	topics: Set<String> = emptySet(),
+	topics: Set<String>,
 	name: String = "kafka-channel",
 	pollInterval: Duration = DEFAULT_POLL_INTERVAL,
-	init: Consumer<K, V>.() -> Unit,
+	consumer: Consumer<K, V> = KafkaConsumer(consumerProperties),
+	init: Consumer<K, V>.() -> Unit = { subscribe(topics) },
 ): ReceiveChannel<UnAckedConsumerRecord<K, V>> {
-	return KafkaFlow(consumerProperties, topics.toList(), name, pollInterval, init).also {
+	return KafkaFlow(consumerProperties, topics, name, pollInterval, consumer, init).also {
 		Runtime.getRuntime().addShutdownHook(Thread {
 			it.cancel()
 		})
@@ -33,9 +34,10 @@ fun <K, V> kafkaFlow(
 
 class KafkaFlow<K, V>(
 	consumerProperties: Map<String, Any>,
-	topics: List<String> = emptyList(),
+	topics: Set<String> = emptySet(),
 	name: String = "kafka-channel",
 	private val pollInterval: Duration = DEFAULT_POLL_INTERVAL,
+	private val consumer: Consumer<K, V> = KafkaConsumer(consumerProperties),
 	private val init: Consumer<K, V>.() -> Unit = { subscribe(topics) },
 ) : ReceiveChannel<UnAckedConsumerRecord<K, V>> {
 	companion object {
@@ -44,7 +46,6 @@ class KafkaFlow<K, V>(
 
 	private val log = KotlinLogging.logger {}
 	private val thread = thread(name = "$name-${threadCounter.getAndIncrement()}", block = { run() }, isDaemon = true, start = false)
-	private val consumer = KafkaConsumer<K, V>(consumerProperties)
 	private val sendChannel = Channel<UnAckedConsumerRecord<K, V>>(Channel.UNLIMITED)
 
 	@OptIn(ExperimentalCoroutinesApi::class)
@@ -61,17 +62,19 @@ class KafkaFlow<K, V>(
 	fun run() {
 		consumer.init()
 
+		log.info("starting thread for ${consumer.subscription()}")
 		runBlocking {
 			try {
 				while (!sendChannel.isClosedForSend) {
+					log.debug("poll(topics:${consumer.subscription()}) ...")
 					val polled = consumer.poll(Duration.ZERO).ifEmpty { consumer.poll(pollInterval) }
 					val polledCount = polled.count()
 					if (polledCount == 0) {
 						continue
 					}
 
-					log.debug("poll() got $polledCount records.")
-					Channel<CommitConsumerRecord<K, V>>(capacity = polled.count()).use { ackChannel ->
+					log.debug("poll(topics:${consumer.subscription()}) got $polledCount records.")
+					Channel<CommitConsumerRecord>(capacity = polled.count()).use { ackChannel ->
 						for (it in polled) {
 							sendChannel.send(UnAckedConsumerRecordImpl(it, ackChannel, System.currentTimeMillis()))
 						}
@@ -80,7 +83,7 @@ class KafkaFlow<K, V>(
 							val count = AtomicInteger(polledCount)
 							while (count.getAndDecrement() > 0) {
 								val it = ackChannel.receive()
-								log.debug { "ack(${it.duration.toMillis()}ms):${it.asCommitable()}" }
+								log.info { "ack(${it.duration.toMillis()}ms):${it.asCommitable()}" }
 								consumer.commitSync(it.asCommitable())
 							}
 						}
@@ -97,8 +100,12 @@ class KafkaFlow<K, V>(
 
 	fun start() {
 		if (!thread.isAlive) {
-			log.info("starting consumer thread")
-			thread.start()
+			synchronized(thread) {
+				if (!thread.isAlive) {
+					log.info("starting consumer thread")
+					thread.start()
+				}
+			}
 		}
 	}
 
